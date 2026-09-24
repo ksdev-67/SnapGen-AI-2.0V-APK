@@ -1,0 +1,110 @@
+name: Build SnapGen AI APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      APK_NAME: SnapGen-AI-v2.0.apk
+      KEYSTORE_FILE: keystore/snapgen.keystore
+      KEY_ALIAS: snapgen
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'snapgen-ks-2026' }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'snapgen-ks-2026' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unpack the project zip
+        run: |
+          test -f snapgen-ai-apk-project.zip || { echo "Upload snapgen-ai-apk-project.zip to the repo root first."; exit 1; }
+          unzip -q -o snapgen-ai-apk-project.zip
+          ls snapgen-ai
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install web dependencies
+        working-directory: snapgen-ai
+        run: npm install --no-audit --no-fund --legacy-peer-deps
+
+      - name: Build the web app
+        working-directory: snapgen-ai
+        run: npm run build
+
+      - name: Create the Android project
+        working-directory: snapgen-ai
+        run: npx cap add android
+
+      - name: Apply SnapGen settings
+        working-directory: snapgen-ai
+        run: node scripts/patch-android.mjs
+
+      - name: Sync web app into Android
+        working-directory: snapgen-ai
+        run: npx cap sync android
+
+      - name: Build release APK
+        working-directory: snapgen-ai/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Align and sign
+        working-directory: snapgen-ai
+        run: |
+          set -euo pipefail
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          UNSIGNED="$(find android/app/build/outputs/apk/release -name '*.apk' | head -1)"
+          mkdir -p dist
+          "$BT/zipalign" -f -p 4 "$UNSIGNED" dist/aligned.apk
+          "$BT/apksigner" sign \
+            --ks "$KEYSTORE_FILE" \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --out "dist/$APK_NAME" dist/aligned.apk
+          rm -f dist/aligned.apk dist/*.idsig
+          "$BT/apksigner" verify --print-certs "dist/$APK_NAME" | tee dist/certificate.txt
+
+      - name: Show the SHA-1 to add in Firebase
+        working-directory: snapgen-ai
+        run: |
+          SHA1="$(grep -i 'SHA-1 digest' dist/certificate.txt | head -1 | awk '{print $NF}')"
+          {
+            echo "### Add this SHA-1 in Firebase (Project settings -> dev.snapgenai.ks.app -> Add fingerprint)"
+            echo "\`$SHA1\`"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SnapGen-AI-APK
+          path: snapgen-ai/dist/${{ env.APK_NAME }}
+          if-no-files-found: error
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: snapgen-ai/dist/${{ env.APK_NAME }}
